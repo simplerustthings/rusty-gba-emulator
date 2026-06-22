@@ -1,0 +1,263 @@
+use crate::{impl_save_state_fields, impl_save_state_tuple};
+use crate::BitIndex;
+
+use crate::{interrupt::InterruptKind, scheduler::Event, Gba};
+
+const NUM_TIMERS: usize = 4;
+const OVERFLOW: usize = 0x1_0000;
+const INTERRUPTS: [InterruptKind; 4] = [
+    InterruptKind::Timer0,
+    InterruptKind::Timer1,
+    InterruptKind::Timer2,
+    InterruptKind::Timer3,
+];
+
+/// State for the timers in the system.
+///
+/// The timers aren't incremented every "clock cycle" like they would be in hardware.
+/// Instead, we update them in bulk by comparing the current scheduler timestamp
+/// to the last time they were updated. We do these updates only when we need to:
+/// when a timer register is read or written. We also keep track of when the next
+/// overflow IRQ is going to happen, and set up a scheduler event so we don't miss it.
+pub struct TimerManager {
+    timers: [Timer; NUM_TIMERS],
+    /// Last timestamp the timers were updated.
+    last_update: usize,
+}
+
+impl_save_state_fields!(TimerManager { timers, last_update });
+
+/// A single timer.
+#[derive(Default, Debug)]
+struct Timer {
+    /// Current count of the timer.
+    count: u16,
+    /// Initial/reload count of the timer.
+    initial_count: u16,
+    /// Control register.
+    control: TimerControl,
+}
+
+impl_save_state_fields!(Timer { count, initial_count, control });
+
+/// Timer control register.
+#[derive(Copy, Clone, Default)]
+struct TimerControl(u16);
+
+impl_save_state_tuple!(TimerControl);
+
+impl TimerControl {
+    /// Returns the prescaler period in cycles.
+    fn period(self) -> usize {
+        [1, 64, 256, 1024][self.0.bit_range(0..2) as usize]
+    }
+
+    /// Returns if this timer is in cascade mode.
+    fn cascade(self) -> bool {
+        self.0.bit(2)
+    }
+
+    /// Returns if this timer will raise an interrupt on overflow.
+    fn irq(self) -> bool {
+        self.0.bit(6)
+    }
+
+    /// Returns if this timer is enabled.
+    fn enabled(self) -> bool {
+        self.0.bit(7)
+    }
+}
+
+impl std::fmt::Debug for TimerControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimerControl")
+            .field("period", &self.period())
+            .field("cascade", &self.cascade())
+            .field("irq", &self.irq())
+            .field("enabled", &self.enabled())
+            .finish()
+    }
+}
+
+impl TimerManager {
+    pub fn new() -> TimerManager {
+        TimerManager {
+            timers: <[Timer; NUM_TIMERS]>::default(),
+            last_update: 0,
+        }
+    }
+}
+
+/// Get the number of multiples of the period in the range.
+/// For example, the 1024 prescaler ticks at 0, 1024, 2048, etc.
+/// In the range (500, 600], there are no ticks. In the range (1020, 1030],
+/// there is one. (1023, 1024] -> 1. (1024, 1025] -> 0.
+/// The start is exclusive and the end (start + duration) is inclusive.
+#[inline(always)]
+fn multiples_in_range(period: usize, start: usize, duration: usize) -> usize {
+    match period {
+        1 => duration,
+        64 => ((start + duration) >> 6) - (start >> 6),
+        256 => ((start + duration) >> 8) - (start >> 8),
+        1024 => ((start + duration) >> 10) - (start >> 10),
+        _ => ((start + duration) / period) - (start / period),
+    }
+}
+
+impl Gba {
+    /// Update timers so that their state is such that they have been ticking
+    /// this whole time since the last update.
+    ///
+    /// The first possible prescaler clock tick happens at (last_update + 1).
+    ///
+    /// This may result in interrupts. For accurate timing, this should be called
+    /// as soon as possible after an interrupt would happen (using the
+    /// [`calculate_next_irq`] function).
+    pub(crate) fn timer_update(&mut self) {
+        let last_update = self.timer.last_update;
+        let steps = self.scheduler.timestamp() - last_update;
+        self.timer.last_update = self.scheduler.timestamp();
+
+        let mut last_overflows = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..NUM_TIMERS {
+            let timer = &mut self.timer.timers[i];
+            if !timer.control.enabled() { continue; }
+            let increment = if timer.control.cascade() {
+                last_overflows
+            } else {
+                multiples_in_range(timer.control.period(), last_update, steps)
+            };
+
+            let initial = timer.initial_count as usize;
+            let period = OVERFLOW - initial;
+            let time_to_overflow = OVERFLOW - (timer.count as usize);
+            if increment >= time_to_overflow {
+                let overflow = increment - time_to_overflow;
+                timer.count = ((overflow % period) + initial) as u16;
+                last_overflows = 1 + (overflow / period);
+            } else {
+                timer.count += increment as u16;
+                last_overflows = 0;
+            }
+
+            if last_overflows > 0 {
+                if timer.control.irq() {
+                    self.interrupt_raise(INTERRUPTS[i]);
+                }
+                if i == 0 || i == 1 {
+                    self.apu_on_timer_overflow(i);
+                }
+            }
+        }
+    }
+
+    /// Calculate how many cycles until the next time we may have to fire an IRQ
+    /// (or have the APU update a DMA channel).
+    fn calculate_next_irq(&mut self) -> Option<usize> {
+        // Early return: if no enabled timers have IRQ set, no IRQ needed.
+        let irq_possible = (0..NUM_TIMERS).any(|i| self.timer_overflow_visible(i));
+        if !irq_possible {
+            return None;
+        }
+        let mut first_irq: Option<usize> = None;
+
+        // If the previous timer will overflow,
+        // the time until the next overflow and the period of subsequent overflows.
+        let timestamp = self.scheduler.timestamp();
+        let mut last_overflow: Option<(usize, usize)> = None;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..NUM_TIMERS {
+            let timer = &mut self.timer.timers[i];
+            if timer.control.enabled() {
+                let next_ticks = if timer.control.cascade() {
+                    // This timer's ticks depend on the previous timer's overflows.
+                    last_overflow
+                } else {
+                    // This timer's ticks depend on premultiplier.
+                    let period = timer.control.period();
+                    let next_tick = period - (timestamp & (period - 1));
+                    Some((next_tick, period))
+                };
+                if let Some((first_tick, tick_period)) = next_ticks {
+                    // Ticks needed until next overflow.
+                    let needed = OVERFLOW - (timer.count as usize);
+                    let first_overflow = first_tick + (tick_period * (needed - 1));
+                    // Ticks needed for next overflow.
+                    let needed_next = OVERFLOW - (timer.initial_count as usize);
+                    let next_overflow = tick_period * needed_next;
+                    last_overflow = Some((first_overflow, next_overflow));
+
+                    if self.timer_overflow_visible(i) && first_overflow < first_irq.unwrap_or(usize::MAX) {
+                        first_irq = Some(first_overflow);
+                    }
+                } else {
+                    last_overflow = None;
+                }
+            } else {
+                // This timer is not enabled and thus will never overflow.
+                last_overflow = None;
+            }
+        }
+
+        first_irq
+    }
+
+    /// Returns whether a timer's overflow is externally visible (i.e. causes an IRQ
+    /// or affects the APU), and thus requires the scheduler to tell us when it happens.
+    fn timer_overflow_visible(&self, index: usize) -> bool {
+        let enabled = self.timer.timers[index].control.enabled();
+        let event = self.timer.timers[index].control.irq() || self.apu_needs_timer(index);
+        enabled && event
+    }
+
+    /// Schedule an event to make us update timers when there's an IRQ.
+    /// Assumes the timers are up-to-date.
+    /// Optionally cancels the previous IRQ events.
+    fn schedule_irq_event(&mut self, cancel_others: bool) {
+        if cancel_others {
+            self.scheduler.cancel_event(Event::TimerUpdate);
+        }
+        if let Some(next_irq) = self.calculate_next_irq() {
+            self.scheduler.push_event(Event::TimerUpdate, next_irq);
+        }
+    }
+
+    /// Handle a scheduler timer update event.
+    pub(crate) fn timer_handle_event(&mut self) {
+        self.timer_update();
+        self.schedule_irq_event(false);
+    }
+
+    pub(crate) fn timer_write_counter(&mut self, index: usize, value: u16) {
+        self.timer_update();
+        self.timer.timers[index].initial_count = value;
+        // Do NOT set count here — the counter continues running.
+        // The reload value is only used on next overflow.
+        self.schedule_irq_event(true);
+    }
+
+    pub(crate) fn timer_read_counter(&mut self, index: usize) -> u16 {
+        self.timer_update();
+        if self.timer.timers[index].control.enabled() {
+            self.timer.timers[index].count
+        } else {
+            self.timer.timers[index].initial_count
+        }
+    }
+
+    pub(crate) fn timer_write_control(&mut self, index: usize, value: u16) {
+        self.timer_update();
+        let new = TimerControl(value);
+        let old = self.timer.timers[index].control;
+        if new.enabled() && !old.enabled() {
+            self.timer.timers[index].count = self.timer.timers[index].initial_count;
+        }
+        self.timer.timers[index].control = new;
+        self.schedule_irq_event(true);
+    }
+
+    pub(crate) fn timer_read_control(&mut self, index: usize) -> u16 {
+        self.timer.timers[index].control.0
+    }
+}
