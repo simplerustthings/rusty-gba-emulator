@@ -1,0 +1,92 @@
+use super::{CpuExecutionState, CpuMode, Gba};
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+#[allow(unused)]
+pub enum ExceptionType {
+    Reset,
+    Undefined,
+    SoftwareInterrupt,
+    PrefetchAbort,
+    DataAbort,
+    Irq,
+    Fiq,
+}
+
+impl ExceptionType {
+    /// Return the address of the exception vector for this type.
+    #[inline(always)]
+    fn vector(self) -> u32 {
+        use ExceptionType::*;
+        match self {
+            Reset => 0x0000_0000,
+            Undefined => 0x0000_0004,
+            SoftwareInterrupt => 0x0000_0008,
+            PrefetchAbort => 0x0000_000C,
+            DataAbort => 0x0000_0010,
+            Irq => 0x0000_0018,
+            Fiq => 0x0000_001C,
+        }
+    }
+
+    /// Return the mode of the exception.
+    #[inline(always)]
+    fn mode(self) -> CpuMode {
+        use ExceptionType::*;
+        match self {
+            Reset => CpuMode::Supervisor,
+            Undefined => CpuMode::Undefined,
+            SoftwareInterrupt => CpuMode::Supervisor,
+            PrefetchAbort => CpuMode::Abort,
+            DataAbort => CpuMode::Abort,
+            Irq => CpuMode::Irq,
+            Fiq => CpuMode::Fiq,
+        }
+    }
+}
+
+impl Gba {
+    pub(crate) fn cpu_exception(&mut self, kind: ExceptionType, return_address: u32) {
+        if kind == ExceptionType::SoftwareInterrupt
+            && std::env::var_os("GBA_TRACE_SWI").is_some()
+            && self.scheduler.timestamp() > 200_000_000
+        {
+            eprintln!(
+                "SWI t={} return={:08X} v={}",
+                self.scheduler.timestamp(),
+                return_address,
+                self.ppu.vcount
+            );
+        }
+        // On IRQ entry NanoBoyAdvance's `SignalIRQ` first performs one
+        // discarded code fetch at r15 (the next prefetch address) before
+        // reloading the pipeline from the vector. This keeps the cartridge
+        // prefetch buffer and bus timing consistent with the interrupted
+        // instruction stream.
+        if kind == ExceptionType::Irq {
+            let pc = self.cpu.pc;
+            let access = self.cpu.next_fetch_access;
+            match self.cpu.cpsr.execution_state {
+                CpuExecutionState::Arm => {
+                    let _ = self.cpu_fetch32(pc, access);
+                }
+                CpuExecutionState::Thumb => {
+                    let _ = self.cpu_fetch16(pc, access);
+                }
+            }
+        }
+
+        let new_mode = kind.mode();
+        let new_index = new_mode.bank_index();
+
+        self.cpu.gpr_banked_r14[new_index] = return_address;
+        self.cpu.spsr_banked[new_index] = self.cpu.cpsr.into();
+        self.cpu_set_mode(new_mode);
+        self.cpu.cpsr.execution_state = CpuExecutionState::Arm;
+        if kind == ExceptionType::Reset || kind == ExceptionType::Fiq {
+            self.cpu.cpsr.interrupt_f = true;
+        }
+        self.cpu.cpsr.interrupt_i = true;
+        self.cpu_jump(kind.vector());
+    }
+}
+
